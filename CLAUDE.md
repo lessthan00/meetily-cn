@@ -453,3 +453,299 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 
 **Whisper Integration**:
 - [frontend/src-tauri/src/whisper_engine/whisper_engine.rs](frontend/src-tauri/src/whisper_engine/whisper_engine.rs) - Whisper model management and transcription
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked as local markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default canonical labels are used as-is (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context repo — one `CONTEXT.md` at the root, ADRs in `docs/adr/`. See `docs/agents/domain.md`.
+
+## Development Constraints
+
+### 开发优先级层级 (最高原则)
+
+上层是下层的 gate，上层未就绪不得启动下层。严禁跳层。
+
+```
+1. 开发方法论    ← TDD 纪律、Agent 隔离、小步快跑
+2. 开发条件      ← 环境门禁 (Issue-0)、工具链验证
+3. 开发总体需求  ← 10 条功能需求，在约束之下筛选
+4. 系统架构      ← 三层服务拓扑、数据流、会话生命周期
+5. 各系统细节    ← API 契约、数据格式、边界条件
+6. 隔离AI+TDD实现 ← RED→GREEN→REFACTOR，Agent A/B 交替
+7. 模块验证      ← 单元测试通过，TDD 循环内完成
+8. 系统联调      ← 集成冒烟 gate (B4 后 E2E 10s)
+9. 系统测试      ← 完整用户路径 E2E，人工验证
+10. 打包         ← start.sh/start.bat
+```
+
+### 逐循环前置检查 (第 2 层 — 开发条件)
+
+**此检查由人执行，不是 AI agent。** 每个 TDD 循环前 30 秒。
+
+```
+1. git status           — 工作区干净？在正确分支？
+2. git log -3           — 上一循环的 commit 在 log 中可读？
+3. 读 issue 文件         — 子任务描述够写测试？(粗判)
+4. 编译/测试发现验证      — Rust: cargo build && cargo test --no-run
+                            Python: pytest --co
+5. 新 Agent 窗口         — 新 session、无上一循环残留上下文
+6. TDD 编号已填入        — 提示词模板中 [TDD编号] 已替换
+```
+
+前 4 条是硬 gate，任一条不过 → 不开工。后 2 条是操作纪律。
+
+**循环失败恢复**：上一循环升级后，重新执行全部 6 条。升级报告不放工作区，开新窗口时附带升级报告的路径即可。
+
+### Spec 就绪 Gate (第 2 层)
+
+Agent A 在写 RED 测试前，检查 issue 文件中是否包含：
+
+- **输入数据格式** — 函数签名、参数类型、数据结构
+- **预期输出格式** — 返回值、副作用、error 类型
+- **至少一个 concrete example** — 给定 X → 期望 Y
+
+缺任一项 → Agent A 输出 `[HUMAN ESCALATION] Spec incomplete: <具体缺什么>`，不自己猜测补充。
+
+### 操作基础设施 (第 2 层 — 衔接层 1 与层 6)
+
+**人的完整操作手册**: `.scratch/funasr-migration/HUMAN-GUIDE.md`。Agent 无需读此文件。
+
+#### 交接文件
+
+Agent A 完成 RED commit 后，将交接包写入文件，**不靠人复制粘贴**：
+- 路径: `.scratch/funasr-migration/tdd/{TDD编号}-handoff.md`
+- Agent B 的提示词模板引用该文件路径
+
+#### 升级报告
+
+Agent 升级后，升级报告写入文件：
+- 路径: `.scratch/funasr-migration/tdd/{TDD编号}-escalation.md`
+- RED commit **保留**在 git history 中，不回退
+- 人工解决后，新的 RED commit 替代上一个
+
+#### 分支策略
+
+- 每个 issue 一条分支。Issue 内所有 TDD 循环 commit (RED+GREEN+REFACTOR) 都堆在同一条分支上
+- 人类只在 issue 全部完成后 merge 到 main，不分步 merge
+- `git bisect` 视角：一个 commit = 一个可编译的状态点
+
+#### Issue 上下文文件 — 知识索引
+
+每个 issue 维护一个上下文文件，**作为 Agent 的导航锚点**。Agent 打开后第一眼看它而非从头啃 5 个文件。
+
+- 路径: `.scratch/funasr-migration/tdd/{issue-slug}-context.md`
+- 由人类在 issue 启动时初始化
+
+**文件格式**：
+
+```
+# context: {issue-slug}
+
+## 我的位置
+Issue {N} / 当前 TDD: {编号} / 上一步: {上一步状态}
+
+## 我需要知道什么
+
+| 我想知道 | 去这里 |
+|---|---|
+| 领域术语 | ../../../../CONTEXT.md |
+| 架构决策 | ../../../../docs/adr/003-... |
+| 本次要建什么 | ../issues/{N}-{slug}.md |
+| API 契约 | ../../../../docs/api/{funasr\|fastapi}.md |
+| 前几个 TDD 做了什么 | (本文件 — 历史记录) |
+
+## 历史记录
+[{TDD编号}] [状态] 测试意图: ... | 实现策略: ... | 重构: ...
+```
+
+**每次循环后**：Agent 在历史记录栏追加一行。下一个 Agent 打开时先读本文件，再按索引定向读具体文件，不从零啃 5 个文件。
+
+### 功能需求 (第 3 层 — 开发总体需求)
+
+优先级从高到低排列。上方未完成时不启动下方。
+
+| 优先级 | # | 需求 | 核心交付 |
+|---|---|---|---|
+| P1 | 1 | **实时中文转录** | FunASR SenseVoiceSmall，每 2s 固定 chunk，返回 segments |
+| P2 | 2 | **声纹注册** | 固定文本朗读，CAM++ 256 维向量，FunASR 侧 SQLite |
+| P3 | 7 | **摘要生成** | Ollama qwen3:8b，用户手动触发 |
+| P4 | 9 | **一键启动脚本** | Windows .bat + Debian .sh，自动安装依赖 |
+| P5 | 10 | **离线音频导入** | 中文音频文件 → 转录 + 说话人分离 + 摘要 |
+| P6 | 6 | **崩溃容灾** | 断路器 + 渐进式健康探测 + resume_from 续传 |
+| P7 | 3 | **实时说话人标注** | 3 级决策：≥0.7 匹配 / k-means 聚类 / 自适应扩容 |
+| P8 | 4 | **会后命名** | 聚类标签 → 姓名，命名后落 DB，sidecar 防丢 |
+| P9 | 5 | **声纹导入/导出** | v1 明文 JSON，v2 加密 |
+| P10 | 8 | **Markdown 导出** | `**姓名** (HH:MM:SS): 内容` 格式 |
+| P11 | 11 | **双路混音** | 麦克风 + 系统音频同时采集、RMS 混音。录音 48kHz 双路存档 + 16kHz 混音送转录 |
+
+**补充需求** (不属于 P1-P11，但架构必须反映)：
+
+- **录音格式**: 48kHz WAV，边录边写 (chunk-by-chunk 追加，非内存缓冲)。录音结束时才 flush 会导致崩溃后文件损坏。双路存档 + 16kHz 混音送转录。
+- **录音生命周期**: 用户选择磁盘路径。录音文件**永不自动删除**——录音是最终真相源，安全优先。
+- **旧数据兼容**: 不需要。FunASR 迁移是全新起点，旧 meetings 表结构直接变更。
+- **离线导入格式**: 依赖 ffmpeg 做格式转换 (MP3/M4A/... → 16kHz mono WAV)。
+- **声纹注册文本**: "北风与太阳" (标准中文语音学朗读文本，~150 字，覆盖全音素)。
+- **隐私边界**: 零遥测、零云端、零自动更新检查。纯本地。
+- **长会议 segments 安全**: 每 5 分钟增量追加 segments 到 sidecar。Tauri 崩溃也不丢已转录内容。sidecar 是 segments 恢复的唯一载体，无需数据库记录中转。
+- **ffmpeg**: 随应用自带 (Tauri bundle)，不依赖系统安装。离线音频导入时自动调用格式转换。
+
+### 运行环境
+
+- **全本地部署** — FunASR (:8178) + FastAPI (:5167) + Ollama (:11434) 均本机运行
+- **平台** — Windows + Debian
+- **Python 3.9+** — FunASR + FastAPI
+- **Ollama** — 摘要用，需 qwen3:8b 模型
+- **GPU** — FunASR 受益但非必须 (CPU 可跑)
+- **Tauri 2.x + Next.js 14 + React 18** — 前端栈不变
+- **会议时长** — 常超 2h。Session 超时 ≥ 4h。k 默认 3
+- **同时说话人数** — 一般 ≤ 7，极端 ≤ 10+。自适应扩容必须覆盖 3→10 的跨度
+- **转录延迟** — < 3s (chunk 到达 → segment 返回)
+- **模型磁盘** — 无限制 (SenseVoiceSmall ~230MB)
+
+### 编程约束 (最高优先级)
+
+1. **严格 TDD** — RED → GREEN → REFACTOR，一个 TDD 循环 = 一个 git commit。小步快跑，一个循环不涉及太多变更
+2. **Agent 隔离** — 写测试的 agent 与写实现的 agent 分离，禁止同一 agent 自测自写。一个 agent 写测试并 commit (RED)，另一个 agent 读测试、写实现并 commit (GREEN)，交替进行，始终保持测试与实现由不同上下文窗口产出。REFACTOR 阶段由原测试作者 (Agent A) 执行——如发现测试被 Agent B 修改过，回退实现 commit
+3. **单线程顺序执行** — 同一时刻只有一个 agent 在写代码，不与 Agent 隔离冲突——隔离 = 分工，单线程 = 并发度
+4. **TDD 硬性时限** — 每个 TDD 循环 ≤ 1.5h。超时 → agent 输出失败报告 (卡在哪里、缺什么信息)，人工介入。不回退，不自行改测试降难度
+5. **不跳过 TDD** — 需要人工帮助时明确提示，不找任何理由绕过 TDD 流程
+6. **禁止改测试意图** — Agent B (实现者) 不得修改 assert 语义、测试逻辑、输入输出期望。但以下机械适配 Agent B **可以且必须修正**：import 路径错误、函数名拼写不匹配、类型签名偏差。修正后必须在 commit message 注明。测试过不了就找人，不自改
+7. **单 commit 单逻辑单元** — 每个 commit `cargo build` 必须通过，git bisect 友好
+8. **不并行保留新旧引擎** — git revert 即回归，不维护 Whisper/Parakeet 兼容路径
+9. **Rust 不持有 SQLite** — 持久化通过 FunASR/FastAPI API 或 JSON sidecar
+10. **网络** — Debian，可连外网，代理端口 socks(7898) / http(7899)
+11. **Agent 上下文防污染** — 每个 agent 启动时必须读：ADR-003、CONTEXT.md、当前 issue 文件、上游依赖 issue 文件。用三句话简述自己的理解后再动代码。禁止跳过
+12. **Issue-0 环境门禁** — pip install funasr + cargo build + cargo test 空跑 + pytest 空跑 全部通过后，才能开始 Issue A
+13. **粒度验证** — 第一个 agent 窗口拿最复杂的 TDD (03b k-means) 跑完整循环，回流实际时长/token，调整其余估时
+14. **集成冒烟 gate** — B4 (接线 commit) 后必须跑 E2E 冒烟：录音 10s → 前端出中文。不通过则 B1-B3 不算完成
+15. **工具链验证** — Issue-0 确认 `cargo test` 增量编译 < 60s，否则配 sccache。Python 用 `pytest --lf` 只跑失败
+
+### TDD 操作规范 (第 1 层 — 开发方法论)
+
+> **阅读顺序**: 先读 A (RED 标准) ← 入口规范，再读 G (失败报告) 和 I (人工升级) ← 安全阀，然后按需翻阅其余。B/C/D/E/F/H 为执行细节。
+
+#### A. RED 标准 — 合格的"测试先红"
+
+不合格的红 (Agent A 不得提交)：
+- `assert 1 == 2` — 无意图，import 后就能绿
+- `import nonexistent_module` — 语法红，加文件就绿
+- `assert result is not None` — 太弱，空实现返回值就绿
+
+合格的红必须同时满足：
+- 断言击中本 TDD 子任务的目标行为（不是通用断言）
+- 失败原因 = 功能还没实现（不是 import 错误、语法错误、类型错误）
+- 一旦功能正确实现，该断言自然通过
+
+**Agent A 提交前必须实际运行测试并看到红** — 不得跳过运行直接 commit。运行失败原因必须是"目标功能尚未实现"，不是 import 错误或语法错误。
+
+**测试文件位置约定** (Agent A 在 RED commit 中确定)：
+- Rust: `src/audio/chunk_accumulator.rs` (实现) ↔ `src/audio/chunk_accumulator.rs` 内嵌 `#[cfg(test)] mod tests`
+  - 新建模块：Agent A 创建 `src/<mod>/<file>.rs` 的骨架（仅 `pub struct`/`pub fn` 签名），测试写在同文件 `#[cfg(test)]` 内
+- Python: `services/funasr/speaker_clusterer.py` (实现) ↔ `services/funasr/tests/test_speaker_clusterer.py`
+  - Agent A 创建空的实现文件骨架（仅 class/def 签名 + `pass`），测试文件 import 该骨架
+
+Agent A 的 RED commit 包含: 测试文件 + 实现文件骨架（仅签名，无逻辑）。Agent B 拿到后只需在骨架中填逻辑。
+
+#### B. GREEN 标准 — 合理的最小实现
+
+- 禁止硬编码测试答案。例：测试 `sum([1,2,3]) == 6`，可以写 `sum(iterable)` 但不能 `return 6`
+- 可以用通用逻辑处理当前测试的所有输入，不需要处理未覆盖的边缘情况
+- 边缘情况留给下一轮 TDD
+
+#### C. REFACTOR 范围 — 保守级
+
+Agent A 只能做"让前面两个人工作像一个人写的"：
+- 同文件内：重命名变量、提取私有函数、消除重复、用 idiomatic 写法
+- 禁止：改 API 签名、改返回类型、跨文件移动代码、重构模块结构
+- 更大重构 → 记录为下一轮 TDD 的输入，不自作改动
+
+#### D. Commit 规范 — TDD 可追溯性
+
+每循环 3 个 commit，格式：`[阶段] TDD编号 模块: 目标行为`
+
+```
+[RED] 03b k-means: failing test for adaptive cluster expansion
+[GREEN] 03b k-means: implement add_embedding with k+1 expansion
+[REFACTOR] 03b k-means: extract centroid distance helper
+```
+
+#### E. 不需要 TDD 的内容
+
+以下跳过 TDD，直接实现：
+
+| 类型 | 示例 | 原因 |
+|---|---|---|
+| 纯删除 | B5-B10 (删 whisper_engine 等) | 无新行为可测 |
+| 集成接线 | B4 (改管线接 FunASR)、C1-C5 | 结构变更，正确性由 E2E 冒烟验证 |
+| 配置脚本 | Issue-0、start.sh/start.bat | 纯环境操作 |
+| 前端 UI 布局 | 声纹注册页、命名弹窗 | 视觉组件，pytest/cargo test 无法测 |
+
+#### F. 测试质量标准
+
+每个 TDD 子任务的测试至少覆盖：
+
+| 必须 | 示例 (03b k-means) |
+|---|---|
+| Happy path | `add_embedding(emb)` → 分配到最近质心 |
+| 至少一个边界 | 空聚类时第一个 embedding → 创建第一个质心 |
+| 至少一个错误路径 | 超过 k 个说话人时触发自适应扩容 k+1 |
+
+不满足 → Agent A RED commit 不合格，回退重写。
+
+#### G. Agent B 失败报告格式
+
+在 1.5h 内无法 GREEN 时，输出：
+
+```
+### 失败报告 — [TDD编号]
+
+**失败的 assert**: <具体断言行>
+**当前实现策略**: <一句话>
+**怀疑点**:
+  - 测试可能有问题: <原因 / 无>
+  - 实现不够: <原因 / 无>
+  - 缺信息: <需要什么>
+**当前代码能编译/通过 import**: <是/否>
+**建议**: <人工往哪个方向看>
+```
+
+禁止模糊描述（"不太行"、"有 bug"）——必须指向具体 assert 或具体缺失信息。
+
+#### H. Agent A → Agent B 交接包
+
+Agent B 拿到的不只是红测试文件：
+
+```
+### Agent A 交接
+
+**TDD 编号**: 03b
+**测试意图**: <一句话>
+**关键假设**: <Agent A 写了测试基于什么假设>
+**输入/输出约定**: <具体的数据进出>
+**已知不足**: <什么没测，留给下一循环>
+```
+
+Agent B 回复"理解：[一句话重述意图]"后才能开始写实现。
+
+#### I. 人工升级触发器
+
+以下情况立即停止、报告 `[HUMAN ESCALATION]`、不自己猜：
+
+| 触发条件 | 典型信号 |
+|---|---|
+| Spec 模糊 | 测试写什么不清楚、需求在 issue 里找不到对应描述 |
+| 环境异常 | pip install 失败、cargo build 报非代码错误、端口被占 |
+| 两难取舍 | 两个合理方案互斥、需要拍板但不在 issue spec 里 |
+| 连续两次 GREEN 失败 | Agent B 第一轮写错，第二轮又错 — 第三次大概率退化 |
+| 改动超出范围 | 需要改 issue 未列出的文件、删不该删的 pub API |
+| 测试与代码矛盾 | Agent B 认为测试的输入/输出在真实环境中不可能 |
+| Agent A 卡住 | 无法在 1h 内写出合格的 RED 测试 (spec 模糊 / 不知道测什么 / 无法创建骨架) |
