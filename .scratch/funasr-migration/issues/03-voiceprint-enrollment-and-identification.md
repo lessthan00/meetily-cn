@@ -14,7 +14,7 @@ ADR-003: 声纹识别与说话人分离架构
 
 - **注册**：用户打开声纹注册页 → 看到固定朗读文本 → 点击录音 → 朗读文本 → `POST /enroll` → 服务端校验音频（时长 ≥ 3s）→ CAM++ 提取 256 维声纹向量 → 存入 SQLite `speaker_embeddings` 表 → 前端显示「张甜甜，注册成功」
 
-- **会议开始**：前端弹出输入框 → 用户输入预期说话人数 k（默认 3）→ Rust 调用 `POST /session/start {meeting_id, k}` → FunASR 初始化 k-means 聚类 → 返回 session_id
+- **会议开始**：Rust 调用 `POST /session/start {meeting_id}` → FunASR 初始化 k-means 聚类 (初始 k=3，自适应扩容) → 返回 session_id。不需要用户输入 k——增量 k-means 自动处理新说话人加入
 
 - **标注**：会议中 Rust 每 2 秒发送 chunk（携带 session_id）→ FunASR `/process-audio?mode=realtime` 内：
   1. fsmn-vad 切割语音段
@@ -26,32 +26,31 @@ ADR-003: 声纹识别与说话人分离架构
   7. 介于 0.5–0.7 → 归入最近聚类（容忍一次）
   → 前端显示「**张甜甜**: 我觉得…」或「**说话人 A**: 我有个建议…」
 
-- **会后命名 (grill-with-docs 确认)**：采用 **B + 持久化** 方案——命名完成后才保存，保证 DB 里不出现临时标签。
+- **会后命名 (grill-with-docs 确认, 更新 2026-05-23)**：**会中点名 + 会后扫尾** 共存。
   ```
-  停止录音 → Rust 调用 POST /session/end {session_id}
+  会中：点击说话人标签 → 弹出输入框或选择已注册声纹 → 该 speaker 的后续 segments 即刻用新姓名。旧 segments 保持聚类标签 (不追溯)
+  
+  会后：停止录音 → Rust 调用 POST /session/end {session_id}
     → FunASR 返回 {speakers: [{label, segment_count, total_duration}]}
     → FunASR 销毁该 session 的 k-means 内存状态
-    → Rust 将自身累加的 segments 写入 sidecar (raw_segments 字段) — 防刷新丢失
     → Rust emit "session-ended" 给前端 (含聚类摘要)
 
   前端弹出「未注册说话人命名」界面 (数据来源: session-ended event)
-    → 用户输入: 说话人 A → "李四", 说话人 B → "王五"
-    → 已注册说话人 (如 "张甜甜") 已在会议中标注，不在命名列表中
-    → 跳过某说话人 → 保留「说话人 A」标签 (用户可接受不命名)
+    → 仅列 named=false 的聚类标签 (会中已命名的自动排除)
+    → 用户批量输入: 说话人 A → "李四", 说话人 B → "王五"
+    → 允许跳过 → 保留「说话人 A」标签
 
   用户确认命名 →
     → 前端调 Rust command: apply_speaker_names(meeting_id, {映射表})
-    → Rust 从 sidecar 读取 segments，替换 speaker 字段
-    → Rust emit "speakers-renamed" → 前端重新渲染转录面板
-    → Rust POST :5167/save-transcript {meeting_id, segments} (带最终姓名，不含临时标签)
-    → 成功后删除 sidecar 中 raw_segments 字段 (或删整个 sidecar)
+    → Rust 更新 segments 的 speaker 字段 → sidecar 中对应行 named=true
+    → Rust emit "speakers-renamed" → 前端重新渲染
+    → Rust POST :5167/save-transcript {meeting_id, segments}
+    → 成功后删除 sidecar
 
   每位命名后提示：「是否为「李四」注册声纹？」
     ├ 是 → 跳转到声纹注册页 → 朗读固定文本 → POST /enroll
-    └ 否 → 仅保存显示名，本次会议使用该名称
+    └ 否 → 仅保存显示名
   ```
-
-  **恢复场景**：如果用户在命名 UI 弹窗前刷新了页面——sidecar 中已有 `raw_segments` 字段。Rust 启动时扫描到残留 segments → 重新 emit "session-ended" → 前端弹出命名 UI。无需离线重处理，聚类标签保留不变。
 
 ### 涉及的代码区域
 
@@ -100,8 +99,9 @@ ADR-003: 声纹识别与说话人分离架构
 
 ```
 POST /session/start
-  body: { meeting_id: "...", k: 3 }
+  body: { meeting_id: "..." }
   response: { session_id: "..." }
+  // 初始 k=3，增量 k-means 自适应扩容。不需要用户输入 k
 
 POST /process-audio?mode=realtime
   multipart: audio (file) + session_id (field)
@@ -120,18 +120,20 @@ POST /session/end
 
 ### 说话人标注阈值
 
-- 余弦相似度 ≥ **0.7** → 匹配为已注册说话人
-- < 0.7 且与某个聚类质心最近 → 标注聚类标签「说话人 A」
-- < 0.5 且与所有质心都不近 → 自适应扩容，新建聚类
+两个独立阈值：
 
-**阈值存储**: FunASR 侧 `config` 表 (`key='similarity_threshold', value='0.7'`)，启动时读取生效。前端设置页 `POST /config` 更新，FunASR 提供 `GET /config` 读取。v1 仅启动时读取——在线修改需重启 FunASR。
+- `similarity_threshold` (默认 **0.7**)：余弦相似度 ≥ 0.7 → 匹配为已注册说话人
+- `cluster_create_threshold` (默认 **0.5**)：< 0.5 且与所有质心都不近 → 自适应扩容 k+1，新建聚类
+- 介于 0.5–0.7 → 归入最近聚类 (容忍一次)
+
+**阈值存储**: FunASR 侧 `config` 表，两个键 `similarity_threshold` + `cluster_create_threshold`。`INSERT OR IGNORE` 幂等初始化。启动时读取，`POST /config {key, value}` 写入时同步更新内存变量，即时生效，不需重启。
 
 ## Acceptance criteria
 
 - [ ] 声纹注册页可访问，固定朗读文本清晰可见
 - [ ] 注册「张甜甜」后，`GET /speakers` 返回该条目
 - [ ] 录音 < 3 秒 → 返回明确错误提示
-- [ ] 会议开始前显示 k 值输入框，默认 3
+- [ ] 会议开始前若声纹库为空 → 弹窗引导「是否现在注册？」→「跳过」/「去注册」
 - [ ] `POST /session/start` 初始化成功，返回 session_id
 - [ ] 同一人再次录音标注，转录旁显示「张甜甜」（阈值 ≥ 0.7 匹配成功）
 - [ ] 未注册说话人标注为「说话人 A」而非「未知说话人」
@@ -142,21 +144,23 @@ POST /session/end
 - [ ] `POST /speakers/import` 增量合并（同名覆盖，不同名新增）
 - [ ] 导入时前端提示隐私警告：「声纹数据包含生物特征，请确认来源可信」
 - [ ] 停止录音后 `/session/end` 返回正确的聚类摘要
-- [ ] 前端弹出命名 UI（已注册说话人不在列表中）
-- [ ] 命名完成后 apply_speaker_names 更新 segments → emit speakers-renamed
-- [ ] save-transcript 在命名完成后调用，DB 中不含「说话人 A」临时标签
+- [ ] 前端弹出批量命名 UI（仅列 named=false 的聚类标签，会中已命名的自动排除）
+- [ ] 命名完成后 apply_speaker_names 更新 segments → sidecar 对应行 named=true → emit speakers-renamed
+- [ ] save-transcript 成功后 DB 中含最终姓名。save 失败 → sidecar 保留，启动时重试
 - [ ] 命名后可选注册声纹 → 「是」跳转注册页，「否」仅保存显示名
-- [ ] 刷新页面丢失命名进度时，从 sidecar `raw_segments` 恢复，无需离线重处理
+- [ ] 刷新页面丢失命名进度时，从 sidecar 恢复 named 状态
 
-## grill-with-docs 确认 (2026-05-20)
+## grill-with-docs 确认 (2026-05-20, 更新 2026-05-23)
 
 - **前端 ↔ FunASR 路径**:
   - 直连: `GET /health`, `GET /speakers`, `GET /config`, `POST /config` (纯 K-V 更新，无副作用，不需经 Rust)
   - 经 Rust (有副作用，需 Rust 协调): `POST /enroll`, `DELETE /speakers/{id}`, `POST /speakers/export`, `POST /speakers/import`
   - 转录链路: Rust → :8178 (`POST /process-audio`, `POST /session/start`, `POST /session/end`)
-- **会后命名全跳过**: 允许用户一个都不命名直接关弹窗。DB 中保留「说话人 A」临时标签。v1 支持从会议详情页重新命名：点击任意临时标签 → 输入真实姓名 → 调 `apply_speaker_names` → 更新 `transcript_json`。与会后弹窗走同一条 command
-- **首次启动引导**: 会议开始前若声纹库为空 → 弹窗提示「你还没有注册过声纹，是否现在注册？」→「跳过」/「去注册」
-- **阈值热更新**: `POST /config` 写入时同步更新 FunASR 内存变量，即时生效，无需重启。前端 toast：「阈值已更新，已立即生效」
+- **增量 k-means (Q7)**: 初始 k=3，自适应扩容。不要求用户输入 k。`expected_speakers` 仅用于离线重处理的初始 k
+- **会中命名 + 会后批量命名 (Q9)**: 会中点名即刻生效，会后弹窗统一处理剩余未命名。会中已命名的 (named=true) 自动排除
+- **会后命名全跳过**: 允许用户一个都不命名直接关弹窗。v1 支持从会议详情页重新命名
+- **两个阈值 (Q7)**: `similarity_threshold` (0.7) + `cluster_create_threshold` (0.5)。`POST /config` 写入时同步更新内存变量，即时生效
+- **首次启动引导**: 声纹库为空 → 弹窗引导。跳过 → 正常开会，全部聚类标签
 - **speaker_hints (v2 延后)**: 崩溃后重聚类时无法精确恢复标签映射（无 embedding 缓存），v1 前端标注「说话人信息因服务中断而不完整」，用户通过详情页重命名手动修复
 
 ## Blocked by

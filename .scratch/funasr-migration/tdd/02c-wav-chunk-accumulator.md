@@ -13,115 +13,88 @@
 ```rust
 // test_chunk_accumulator.rs
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+const CHUNK_SAMPLES: usize = 32000; // 2s @ 16kHz
 
-    #[test]
-    fn empty_input_produces_no_output() {
-        let mut acc = ChunkAccumulator::new(/* chunk_samples: */ 32000);
-        let chunks = acc.push(&[]);
-        assert!(chunks.is_empty());
-        assert_eq!(acc.remaining(), 0); // 无残留
-    }
-
-    #[test]
-    fn exactly_one_chunk() {
-        let mut acc = ChunkAccumulator::new(32000);
-        let input = vec![0.0f32; 32000];
-        let chunks = acc.push(&input);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 32000);
-    }
-
-    #[test]
-    fn exactly_two_chunks() {
-        let mut acc = ChunkAccumulator::new(32000);
-        let input = vec![0.0f32; 64000];
-        let chunks = acc.push(&input);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 32000);
-        assert_eq!(chunks[1].len(), 32000);
-    }
-
-    #[test]
-    fn partial_chunk_remains_in_buffer() {
-        let mut acc = ChunkAccumulator::new(32000);
-
-        // 推入 50000 采样 → 1 个完整 chunk + 18000 残留
-        let input = vec![0.0f32; 50000];
-        let chunks = acc.push(&input);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 32000);
-        assert_eq!(acc.remaining(), 18000);
-
-        // 再推 14000 → 填满第二个 chunk（18000 + 14000 = 32000）
-        let input2 = vec![0.0f32; 14000];
-        let chunks2 = acc.push(&input2);
-        assert_eq!(chunks2.len(), 1);
-        assert_eq!(chunks2[0].len(), 32000);
-        assert_eq!(acc.remaining(), 0);
-    }
-
-    #[test]
-    fn multiple_fills_cross_boundary() {
-        let mut acc = ChunkAccumulator::new(32000);
-
-        // 推 10000 × 4 = 超过 32000
-        let chunks = acc.push(&vec![0.0f32; 10000]);
-        assert!(chunks.is_empty());  // 10000 < 32000
-        assert_eq!(acc.remaining(), 10000);
-
-        let chunks = acc.push(&vec![0.0f32; 10000]);
-        assert!(chunks.is_empty());  // 20000 < 32000
-        assert_eq!(acc.remaining(), 20000);
-
-        let chunks = acc.push(&vec![0.0f32; 10000]);
-        assert!(chunks.is_empty());  // 30000 < 32000
-
-        // 再推 10000 → 30000 + 10000 = 40000 → 1 chunk + 8000 残留
-        let chunks = acc.push(&vec![0.0f32; 10000]);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 32000);
-        assert_eq!(acc.remaining(), 8000);
-    }
-
-    #[test]
-    fn flush_drains_remaining_samples() {
-        let mut acc = ChunkAccumulator::new(32000);
-        acc.push(&vec![0.0f32; 18000]);
-        assert_eq!(acc.remaining(), 18000);
-
-        let remainder = acc.flush();
-        assert_eq!(remainder.len(), 18000);
-        assert_eq!(acc.remaining(), 0);
-    }
-
-    #[test]
-    fn flush_empty_returns_empty() {
-        let mut acc = ChunkAccumulator::new(32000);
-        let remainder = acc.flush();
-        assert!(remainder.is_empty());
-    }
-
-    #[test]
-    fn reset_clears_buffer() {
-        let mut acc = ChunkAccumulator::new(32000);
-        acc.push(&vec![0.0f32; 18000]);
-        assert_eq!(acc.remaining(), 18000);
-
-        acc.reset();
-        assert_eq!(acc.remaining(), 0);
-    }
+#[test]
+fn empty_input_produces_none() {
+    let mut acc = ChunkAccumulator::new(CHUNK_SAMPLES);
+    assert_eq!(acc.accumulate(&[]), None);
+    assert_eq!(acc.remaining(), 0);
 }
+
+#[test]
+fn exactly_one_chunk() {
+    let mut acc = ChunkAccumulator::new(CHUNK_SAMPLES);
+    let input = vec![0.0f32; CHUNK_SAMPLES];
+    let chunk = acc.accumulate(&input);
+    assert!(chunk.is_some());
+    assert_eq!(chunk.unwrap().len(), CHUNK_SAMPLES);
+}
+
+#[test]
+fn partial_input_returns_none() {
+    // Q6: 首个 chunk 前 buffer 不满 2s → 返回 None
+    let mut acc = ChunkAccumulator::new(CHUNK_SAMPLES);
+    let chunk = acc.accumulate(&vec![0.0f32; 10000]);
+    assert_eq!(chunk, None);
+    assert_eq!(acc.remaining(), 10000);
+}
+
+#[test]
+fn partial_fills_accumulate_until_full() {
+    let mut acc = ChunkAccumulator::new(CHUNK_SAMPLES);
+    assert_eq!(acc.accumulate(&vec![0.0f32; 10000]), None); // 10000
+    assert_eq!(acc.accumulate(&vec![0.0f32; 10000]), None); // 20000
+    assert_eq!(acc.accumulate(&vec![0.0f32; 10000]), None); // 30000
+    // 再推 10000 → 30000+10000=40000 → 吐 1 chunk + 8000 残留
+    let chunk = acc.accumulate(&vec![0.0f32; 10000]);
+    assert!(chunk.is_some());
+    assert_eq!(chunk.unwrap().len(), CHUNK_SAMPLES);
+    assert_eq!(acc.remaining(), 8000);
+}
+
+#[test]
+fn flush_returns_partial_chunk() {
+    // Q6: 录音停在 1.3s → buffer 有 20800 samples → flush 吐出不足 2s 的 chunk
+    let mut acc = ChunkAccumulator::new(CHUNK_SAMPLES);
+    acc.accumulate(&vec![0.0f32; 20800]);
+    let remainder = acc.flush();
+    assert_eq!(remainder.len(), 20800); // 送 FunASR，不丢弃
+    assert_eq!(acc.remaining(), 0);
+}
+
+#[test]
+fn flush_empty_returns_empty() {
+    let mut acc = ChunkAccumulator::new(CHUNK_SAMPLES);
+    assert!(acc.flush().is_empty());
+}
+
+#[test]
+fn reset_clears_buffer() {
+    let mut acc = ChunkAccumulator::new(CHUNK_SAMPLES);
+    acc.accumulate(&vec![0.0f32; 18000]);
+    assert_eq!(acc.remaining(), 18000);
+    acc.reset();
+    assert_eq!(acc.remaining(), 0);
+}
+
+#[test]
+fn large_input_multi_chunk() {
+    // 单次推入 100000 samples → 3 个满 chunk + 4000 残留
+    let mut acc = ChunkAccumulator::new(CHUNK_SAMPLES);
+    let chunks = acc.accumulate_all(&vec![0.0f32; 100000]);
+    assert_eq!(chunks.len(), 3);
+    assert_eq!(acc.remaining(), 4000);
+}
+```
 ```
 
 ## GREEN — 最小实现
 
 ```rust
-/// 固定窗口音频累加器。
+/// 固定窗口音频累加器 (Q6 边界行为)。
 /// 收任意长度 f32 采样，满 `chunk_samples` 时吐出完整窗口。
-/// 余量滚入下一轮，录制结束时调用 `flush()` 收取残余。
+/// 不满时返回 None，余量滚入下一轮。录制结束时调用 `flush()` 收取残余。
 pub struct ChunkAccumulator {
     chunk_samples: usize,
     buffer: Vec<f32>,
@@ -129,39 +102,37 @@ pub struct ChunkAccumulator {
 
 impl ChunkAccumulator {
     pub fn new(chunk_samples: usize) -> Self {
-        Self {
-            chunk_samples,
-            buffer: Vec::with_capacity(chunk_samples * 2),
+        Self { chunk_samples, buffer: Vec::new() }
+    }
+
+    /// 推入音频采样。满 2s 返回 Some(chunk)，不满返回 None (Q6: 首 chunk 前不发)。
+    pub fn accumulate(&mut self, samples: &[f32]) -> Option<Vec<f32>> {
+        self.buffer.extend_from_slice(samples);
+        if self.buffer.len() >= self.chunk_samples {
+            let chunk: Vec<f32> = self.buffer.drain(..self.chunk_samples).collect();
+            Some(chunk)
+        } else {
+            None
         }
     }
 
-    /// 推入音频采样，返回已满的完整窗口列表。
-    pub fn push(&mut self, samples: &[f32]) -> Vec<Vec<f32>> {
+    /// 批量版 accumulate：用于离线导入或大量数据一次性推入。
+    pub fn accumulate_all(&mut self, samples: &[f32]) -> Vec<Vec<f32>> {
         self.buffer.extend_from_slice(samples);
         let mut chunks = Vec::new();
-
         while self.buffer.len() >= self.chunk_samples {
-            let chunk: Vec<f32> = self.buffer.drain(..self.chunk_samples).collect();
-            chunks.push(chunk);
+            chunks.push(self.buffer.drain(..self.chunk_samples).collect());
         }
-
         chunks
     }
 
-    /// 收取 buffer 中残留的所有采样（不足一个完整窗口）。
+    /// 收取 buffer 中残留的所有采样 (Q6: 不足 2s 也吐出，送 FunASR 不丢内容)。
     pub fn flush(&mut self) -> Vec<f32> {
         self.buffer.drain(..).collect()
     }
 
-    /// 当前 buffer 中残留的采样数。
-    pub fn remaining(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// 清空 buffer（用于首次启动或错误恢复）。
-    pub fn reset(&mut self) {
-        self.buffer.clear();
-    }
+    pub fn remaining(&self) -> usize { self.buffer.len() }
+    pub fn reset(&mut self) { self.buffer.clear(); }
 }
 ```
 

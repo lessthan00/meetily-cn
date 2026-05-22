@@ -30,16 +30,17 @@ ADR-003: 声纹识别与说话人分离架构
 
 2. **Ollama 摘要 prompt**：是否需要更新提示词以利用说话人信息？当前 prompt 可能只针对纯文本设计
 
-3. **Markdown 导出格式**：必须输出如下对齐格式：
+3. **Markdown 导出格式**：必须输出如下对齐格式 (Q12)：
    ```markdown
-   # 会议记录 — 2026-05-17 10:00
-   
+   # 会议标题 — 2026-05-23
+
    ## AI 摘要
-   ...摘要文本...
-   
+   ...摘要文本... (已生成时展示，未生成则跳过此 section)
+
    ## 完整转录
    **张甜甜** (00:00:00): 我认为这个方案可行。
    **说话人 A** (00:00:05): 但是有一些问题...
+   **未知** (00:00:10): ... (speaker=null 时显示"未知")
    ```
 
 4. **会议详情页**：`frontend/src/app/meeting-details/` 确保展示摘要 + 标注说话人的转录
@@ -59,12 +60,16 @@ ADR-003: 声纹识别与说话人分离架构
 - [ ] 会议详情页同时显示摘要和完整转录
 - [ ] 摘要生成失败时优雅降级（显示"摘要生成失败，请重试"）
 
-## grill-with-docs 确认 (2026-05-20)
+## grill-with-docs 确认 (2026-05-20, 更新 2026-05-23)
 
-- **两阶段 commit**: 第一阶段新建端点（`POST /meetings`, `POST /save-transcript`(新), `POST /process-transcript`(新), `POST /generate-title`, `GET /export/{id}?format=md`），第二阶段删除旧端点（`GET /get-summary`, `GET /get-model-config`, `POST /save-model-config`, `GET /get-transcript-config`, `POST /save-transcript-config`, `POST /get-api-key`, `POST /get-transcript-api-key`, `POST /save-meeting-summary`, `POST /search-transcripts`）
-- **`GET /get-meeting/{id}` 改造**: 读 `meetings.transcript_json` 列返回 segments；无则返回空数组（不 fallback 到旧表——旧表已在第二阶段删除）
-- **旧表删除**: `transcripts`/`transcript_chunks`/`summary_processes`/`settings`/`transcript_settings`/`speaker_embeddings` 六张表在第二阶段连同旧端点一并 `DROP TABLE`。`speaker_embeddings` 从 FastAPI 侧删除是因为其正确归属在 FunASR 侧的 `services/funasr/data.db`
-- **save-transcript 容灾**: Rust 调 `POST /save-transcript` 失败 → segments 写入 sidecar (`named_segments` 字段)。Rust 启动/健康恢复后扫描 sidecar → 自动重试保存
+- **两阶段 commit**: 第一阶段新建端点，第二阶段删除旧端点
+- **`GET /get-meeting/{id}` 改造**: 读 `meetings.transcript_json` 列返回 segments；无则返回空数组
+- **旧表删除**: 六张旧表在第二阶段删除
+- **save-transcript 容灾 (Q10 补充)**: Rust 调 save 失败 → sidecar 保留 → 启动时自动重试
+- **自动标题生成 (Q17)**: `/session/end` 后自动调 `POST /meetings/{id}/generate-title` → Ollama 生成 ≤ 10 字标题 → 写入 meetings.title。失败静默降级
+- **摘要 prompt (Q16)**: FastAPI 侧维护中文 system prompt (概述/决议/待办)。用户手动触发
+- **Ollama 安装引导 (Q16 补充)**: 未安装 → 前端横幅 + 安装链接。模型未下载 → 「下载模型」按钮 + 进度条。状态检测: `GET /meetings/{id}/summary-status`
+- **Markdown 含摘要 (Q12)**: 已生成摘要时展示 `## AI 摘要` section，未生成则跳过。speaker=null → `**未知**`
 
 ## Blocked by
 

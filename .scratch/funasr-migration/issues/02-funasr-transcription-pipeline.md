@@ -45,7 +45,11 @@ ADR-003: 声纹识别与说话人分离架构
 - 新建 `audio/chunk_accumulator.rs`
 - 纯逻辑模块：收 16kHz f32 → 满 32000 采样 (2s) → 吐出 Vec<f32> → 余量滚入下一轮
 - 不接线，仅编译通过
-- 测试覆盖：空输入、正好 32000、64000、50000（余数滚存）、48k→16k 重采样后接入
+- 测试覆盖：空输入、正好 32000、64000、50000（余数滚存）
+- **三条边界行为 (Q6)**：
+  1. 录音不足 2s 时 flush → 吐出最后一个不足 2s 的 chunk (fsmn-vad 不依赖固定 2s)
+  2. 首个 chunk 前 buffer 不满 2s → `accumulate()` 返回 `None`，不发
+  3. 跨 chunk 语音段 → Rust 侧不处理拼接，每个 chunk 独立发独立返 (丢失 ≤ 200ms，v1 接受)
 
 > **提醒**: 02-2 和 02-3 合并为 1 个 commit——删 VAD + 接线 FunASR 原子完成，避免中间态 transcription 不工作污染 bisect。
 
@@ -80,12 +84,12 @@ ADR-003: 声纹识别与说话人分离架构
   "text": "转录文本内容（所有 segment 拼接）",
   "segments": [
     {"start": 0.0, "end": 1.2, "text": "我觉得这个方案可行", "speaker": null},
-    {"start": 1.5, "end": 2.0, "text": "嗯我也同意", "speaker": null}
+    {"start": 1.5, "end": 2.0, "text": "嗯我也同意", "speaker": "说话人 A"}
   ]
 }
 ```
 
-> 注：speaker 字段在 segment 层级（非顶层）。本 issue 中 speaker 暂为 null，#03 接入声纹后逐段填充姓名或聚类标签。`segments` 数组是响应主体——前端应按 segment 逐条渲染，而非仅展示 `text` 字段。
+> 注：speaker 字段仅在 segment 层级。`string | null` 三态语义：`null` = CAM++ 无法识别 (噪音)，`"说话人 A"` = 聚类临时标签，`"张甜甜"` = 已注册或已命名。`segments` 数组是响应主体——前端应按 segment 逐条渲染，而非仅展示 `text` 字段。相邻 segment 间允许 gap (fsmn-vad 丢弃静音段)。时间单位 = float 秒 (FunASR 原生输出)。
 
 ## Acceptance criteria
 
@@ -99,13 +103,15 @@ ADR-003: 声纹识别与说话人分离架构
 - [ ] FunASR 首次启动自动下载 SenseVoiceSmall 模型，第二次启动直接加载
 - [ ] FunASR 服务不可用时，前端显示错误提示（而非静默丢弃）
 
-## grill-with-docs 确认 (2026-05-20)
+## grill-with-docs 确认 (2026-05-20, 更新 2026-05-23)
 
 - **FunASR 未就绪处理**: 录音按钮按下时，Rust 调 `POST /session/start` → `ECONNREFUSED` → **不走断路器**，前端弹「语音引擎未启动，请运行 start.sh 或点击启动引擎」+ 「启动引擎」按钮（调 `start-funasr.sh`）。与录音中途崩溃（走断路器）是两条路径
 - **健康检查路径**: 前端直连 `GET :8178/health`（2s 轮询），不经过 Rust
-- **模型下载进度**: `/health` 返回 `{status: "loading", model: "...", progress: 45.0}` → 前端直接解析展示进度条。这条也适用于首次启动（用户双击 Tauri 而非 start.sh 时）
+- **`/health` 三态响应**: `{"status":"loading","model":"...","progress":45.0}` (模型下载中) / `{"status":"ok"}` (就绪) / `{"status":"error","message":"..."}` (失败)。`loading` 不触发断路器
 - **CORS**: FunASR 服务设 `allow_origins=["*"]`。纯本地部署，无安全风险。Tauri webview 的 origin 可能为 `tauri://localhost` 或自定义 scheme，`*` 统一覆盖
 - **错误信封**: FunASR 所有端点统一返回 `{"status": "ok"|"error", ...}`。应用层错误 (status=error) 与传输层错误 (ECONNREFUSED 等) 是两个独立层次，各自处理
+- **Segment 格式 (Q1)**: speaker 仅在 segment 层级 (`string | null`)，不在顶层。三态：null=无法识别、"说话人 A"=聚类标签、"姓名"=已注册/已命名。时间单位 float 秒。相邻 segment 允许 gap
+- **ChunkAccumulator 边界 (Q6)**: flush 时吐不足 2s 余数 → FunASR fsmn-vad 不依赖固定 2s。首 chunk 前 buffer 不满 2s → 返回 None。跨 chunk 语音段 → Rust 不拼接，v1 接受 ≤ 200ms 损失
 
 ## Blocked by
 

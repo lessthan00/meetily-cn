@@ -393,17 +393,18 @@ interface Segment {
 
 ### Q2 — Sidecar JSON 格式
 
-**决策**：JSONL 格式 (每行一个 segment)，追加 `seq` 字段。
+**决策**：JSONL 格式 (每行一个 segment)，追加 `seq` + `named` 字段。
 
 ```jsonl
-{"start":0.0,"end":2.3,"text":"大家好我是张甜甜","speaker":"张甜甜","seq":0}
-{"start":3.2,"end":5.1,"text":"今天讨论一下Q2计划","speaker":"张甜甜","seq":1}
+{"seq":0,"start":0.0,"end":2.3,"text":"大家好","speaker":"说话人 A","named":false}
+{"seq":1,"start":3.2,"end":5.1,"text":"讨论Q2","speaker":"张甜甜","named":true}
 ```
 
 | 决策点 | 选择 | 理由 |
 |---|---|---|
 | 格式 | JSONL (非完整 JSON 数组) | 追加写只需 `O_APPEND`，无需读全文件→改数组→回写；崩溃后文件自然截断到最后完整行，残行丢弃。一个残行 vs 整个 JSON 数组损坏 |
-| 追加字段 | `seq` int (递增序号) | 恢复时用于跳过已处理段，比用时间戳去重可靠 |
+| `seq` | int (递增序号) | 恢复时用于跳过已处理段，比用时间戳去重可靠 |
+| `named` | bool (默认 false) | 区分"聚类标签等待命名"与"已确认姓名待落 DB"。恢复时只重试 `named=true` 的 save-transcript |
 
 **回溯检查**：
 - 过程纪律: sidecar 非 TDD 子任务，属 B4 集成接线。正确性由 E2E 冒烟和崩溃恢复测试验证。无矛盾 无环境依赖
@@ -485,11 +486,13 @@ interface Segment {
 | k-means 聚类模式 | 实时增量更新 (每 segment 即更新质心) | 每 2s chunk ≤ 3 segments，增量开销可忽略。批处理反而引入"多长跑一次"的延迟参数 |
 | 自适应扩容阈值 | 余弦距离 < 0.5 (同一人) / ≥ 0.5 (不同人) → 创建 k+1 | CAM++ 论文基准同人余弦相似度 ≥ 0.7 (距离 ≤ 0.3)。放宽到 0.5 给 k-means 容错空间 |
 | 命名落 DB | 用户命名后 → FunASR SQLite 存 (name, embedding)。不追溯更新已记录 segments 的 speaker 字段 | 旧 segments 保持聚类标签 "说话人 A"，避免"命名一个=更新历史全部"的复杂一致性 |
+| 阈值存储 | FunASR `config` K-V 表。两个键：`similarity_threshold` (0.7) + `cluster_create_threshold` (0.5) | 启动时读取。幂等初始化 `INSERT OR IGNORE` |
+| 阈值热更新 | `POST /config {key, value}` 写入 DB + 同步更新 FunASR 内存变量，即时生效 | 在线调参不需重启 |
 
 **回溯检查**：
-- 过程纪律: 03a (speaker matcher)、03b (k-means) 是 TDD 子任务。决策 1-4 定了 03a/03b 的输入输出和阈值。无矛盾 无环境依赖。余弦距离纯 CPU 计算。无矛盾
-- A1: FR #3「3 级决策 ≥0.7 匹配 / k-means 聚类 / 自适应扩容」。5 条全部在需求范围内。无矛盾
-- A2: ADR-003 §7 定了 CAM++ 256 维向量 + 余弦相似度 + k-means 聚类 + FunASR SQLite 存储。细化不改框架。无矛盾
+- 过程纪律: 03a/03b 是 TDD 子任务。决策定了 03a/03b 的输入输出和阈值。无矛盾 无环境依赖。无矛盾
+- A1: FR #3「3 级决策」。7 条全部在需求范围内。无矛盾
+- A2: ADR-003 §7 定了 CAM++ + 余弦相似度 + k-means + SQLite。细化不改框架。无矛盾
 
 ### Q8 — 声纹注册流程
 
@@ -502,10 +505,11 @@ interface Segment {
 | 存储结构 | 一对多 (一个姓名可存多个 embedding 样本) | 同一人不同设备/距离/mood 语音特征漂移，多样本提高匹配率。匹配取与所有样本的最高相似度 |
 | 重名检测 | 覆盖旧样本。弹确认框后删除旧 embedding 重新提取 | 语义：「我重新录一次自己的声纹」= 替换，不是「加一个样本」 |
 | 注册端点 | `POST /voiceprints/register` → FunASR SQLite | FunASR 是声纹数据唯一 owner，不经过 FastAPI 中转 |
+| 首次声纹库为空 | 会议开始前弹窗：「你还没有注册过声纹，是否现在注册？」→「跳过」/「去注册」 | 引导而非强制。跳过 → 正常开会，全部聚类标签 |
 
 **回溯检查**：
 - 过程纪律: 声纹注册非 TDD 子任务 (注册页属前端 UI)。正确性由人工验证。无矛盾 需 FunASR 运行。Issue-0 已覆盖依赖安装。无矛盾
-- A1: FR #2「固定文本朗读，CAM++ 256 维向量，FunASR 侧 SQLite」。5 条全部在需求范围内。无矛盾
+- A1: FR #2「固定文本朗读，CAM++ 256 维向量，FunASR 侧 SQLite」。6 条全部在需求范围内。无矛盾
 - A2: ADR-003 §7「声纹注册：用户朗读固定文本 → CAM++ → 256 维向量 → 存 FunASR SQLite」。细化不改架构。无矛盾
 
 ### Q9 — 会后命名流程
@@ -514,11 +518,13 @@ interface Segment {
 
 | 决策点 | 选择 | 理由 |
 |---|---|---|
-| 命名时机 | 会议中即允许命名 | 听到熟悉声音立刻可标注。新 segments 即刻用新姓名，旧 segments 保持聚类标签 (Q7 已定不追溯) |
-| 触发方式 | 点击说话人标签 → 弹出输入框或选择已注册声纹 | 两路径：输入新姓名 (创建声纹) / 选择已有姓名 (关联声纹) |
+| 命名时机 | 会议中即允许命名 + 会后弹窗批量命名 | 会中点名 (即刻生效) + 会后扫尾 (统一处理未命名)。互补，非替代 |
+| 会中触发方式 | 点击说话人标签 → 弹出输入框或选择已注册声纹 | 两路径：输入新姓名 (创建声纹) / 选择已有姓名 (关联声纹) |
+| 会后触发方式 | `/session/end` 返回聚类摘要 → 弹出未注册说话人汇总 (label + segment_count) → 用户批量输入姓名 | 数据来源：session/end 的 speakers 数组。已命名 (named=true) 自动排除 |
+| 跳过支持 | 允许关闭弹窗不命名，保留聚类标签 | 不强制命名。详情页可随时重命名 |
 | 是否重新聚类 | 不重聚类 | k-means 在 FunASR 内存中增量更新 (Q7)，命名不改变 embedding 分布 |
-| 新 segments 自动匹配 | 自动匹配 | 命名后后续 segments 即刻用已注册声纹匹配——"我刚告诉你是谁，你该认出来了" |
-| sidecar 中命名信息 | 不单独存命名事件。新 segments 的 speaker 字段直接写姓名而非聚类标签 | sidecar 是 segments 恢复载体，不是操作日志 |
+| 新 segments 自动匹配 | 自动匹配 | 命名后后续 segments 即刻用已注册声纹匹配 |
+| sidecar 中命名信息 | 通过 `named` 字段标记 (Q2)。新 segments speaker 直接写姓名 + named=true | sidecar 是 segments 恢复载体，不是操作日志 |
 
 **回溯检查**：
 - 过程纪律: 会后命名不属 TDD 子任务 (命名 UI 属前端布局)。无矛盾 依赖 FunASR SQLite + FastAPI。Issue-0 已覆盖。无矛盾
@@ -565,10 +571,11 @@ interface Segment {
 
 | 决策点 | 选择 | 理由 |
 |---|---|---|
-| 内容结构 | header (会议标题 + 日期) + 正文 `**姓名** (HH:MM:SS): 内容` | 简单可读，标题便于区分多次导出 |
+| 内容结构 | header (标题+日期) + 可选 `## AI 摘要` + `## 完整转录` + `**姓名** (HH:MM:SS): 内容` | 已生成摘要时展示摘要 section，未生成则跳过 |
+| 摘要来源 | FastAPI `meetings.summary_json` (已存储的摘要文本) | 导出时从 DB 读取，与转录一起写入 Markdown |
 | 时间戳 | 绝对时间 HH:MM:SS，从录音 00:00:00 起算 | SRT/VTT 等字幕格式同用绝对时间。Q1 的 float 秒直接除以取模 |
 | speaker = null | 显示 `**未知**` | 与"说话人 A"区分——null = 无法识别，聚类标签 = 未命名 |
-| 触发方式 | 前端按钮 → Rust `export_markdown(meeting_id)` → 读 sidecar JSONL → 写文件到用户选择路径 | 数据源 sidecar JSONL，不依赖 FastAPI |
+| 触发方式 | 前端按钮 → Rust `export_markdown(meeting_id)` → 读 sidecar JSONL + FastAPI summary → 写文件到用户选择路径 | 双数据源：转录从 sidecar，摘要从 FastAPI |
 | 导出时机 | 允许会议进行中导出 | sidecar 已有 segments 立即可导出，无技术阻塞点 |
 
 **回溯检查**：
@@ -610,31 +617,35 @@ interface Segment {
 - A1: FR #11「双路混音 + 48kHz 双路存档 + 16kHz 混音送转录」。5 条全部对齐。无矛盾
 - A2: ADR-003 §7 + 现有 pipeline.rs RMS ducking。细化不改架构。无矛盾
 
-### Q15 — 断路器 5 种错误类型
+### Q15 — 断路器 6 种错误类型 (差异化策略)
 
-**决策**：统一计为"失败"，状态机视角只区分成功/失败。
+**决策**：错误类型差异化处理——进程级错误立即熔断，服务级错误容忍抖动。
 
-| # | 错误类型 | 场景 | 断路器行为 |
+| # | 错误类型 | 策略 | 理由 |
 |---|---|---|---|
-| 1 | ECONNREFUSED | FunASR 未启动 | 计为 `on_failure` |
-| 2 | ETIMEDOUT (> 5s) | FunASR 挂死无响应 | 计为 `on_failure` |
-| 3 | HTTP 5xx | FunASR 内部错误 (OOM、模型加载失败) | 计为 `on_failure` |
-| 4 | 反序列化失败 | HTTP 200 但 JSON 解析失败 | 计为 `on_failure` |
-| 5 | 503 `{"status":"unhealthy"}` | FunASR 启动中/模型未加载完成 | 计为 `on_failure`。与泛 5xx 区分仅用于日志/调试 |
+| 1 | ECONNREFUSED | 立即打开 | 进程已死，无需再试 |
+| 2 | ECONNRESET | 立即打开 | 进程崩溃中 |
+| 3 | ETIMEDOUT (> 5s) | 重试 1 次，仍失败则打开 | 瞬态网络可自愈 |
+| 4 | HTTP 5xx | 连续 3 次后打开 | 服务活着但出错，容忍抖动 |
+| 5 | 503 `{"status":"unhealthy"}` | 连续 3 次后打开 | 模型加载中，类似 5xx |
+| 6 | 反序列化失败 | 立即打开 | HTTP 200 + JSON 损坏 = 半崩溃状态 |
 
-**05a 纯状态转移表** (无 IO、无网络)：
+**05a 状态转移表** (无 IO、无网络)：
 
 ```
-关闭 → on_failure 连续N次 → 打开
+关闭 → on_failure_instant → 打开 (类型 1/2/6)
+关闭 → on_failure_accumulate 连续3次 → 打开 (类型 4/5)
+关闭 → on_failure_retry → 重试1次 → 仍失败 → 打开 (类型 3)
 打开 → timeout T 后 → 半开
 半开 → on_success 连续2次 → 关闭
 半开 → on_failure 1次 → 打开
+成功 (任一时机) → 重置所有计数器
 ```
 
 **回溯检查**：
-- 过程纪律: 05a 只测 2 个事件的状态转移表。3 状态 × 2 事件 × 2 (连续成功计数) → ~8 条测试。无组合爆炸。无矛盾 纯状态机，无需网络。cargo test 直接测。无矛盾
-- A1: FR #6「断路器 + 渐进式健康探测」。错误分类是断路器前置条件。无矛盾
-- A2: ADR-003 §9 三状态 + 探测间隔。不重叠。无矛盾
+- 过程纪律: 05a 测试覆盖 3 种失败事件路径 + 状态转移。~12 条测试。无组合爆炸。无矛盾 纯状态机。无矛盾
+- A1: FR #6「断路器 + 渐进式健康探测」。差异化更贴合渐进探测意图。无矛盾
+- A2: ADR-003 §9 三状态 + 探测间隔。细化不改框架。无矛盾
 
 ### Q16 — 摘要生成
 
@@ -647,10 +658,63 @@ interface Segment {
 | 存储位置 | FastAPI SQLite `meetings` 表新增 `summary` 列。API: `POST /meetings/{id}/summarize` | FunASR 不管摘要——这是 FastAPI + Ollama 的工作 |
 | 触发方式 | 前端按钮 → Rust invoke → FastAPI → Ollama。生成中 disabled + loading | P3 手动触发，非自动 |
 | Ollama 不在线 | FastAPI 检查 `GET localhost:11434` → 不通 → 返回中文错误 "Ollama 未运行" | 用户可读的错误，非系统级报错 |
+| Ollama 未安装 | 前端「生成摘要」区域横幅 + 「安装 Ollama」按钮 → 打开浏览器 | Tauri 不替用户装系统软件 |
+| qwen3:8b 未下载 | 前端「下载模型」按钮 → Tauri 调 `ollama pull qwen3:8b` → 解析 stdout 进度条 | Ollama CLI 自带进度输出 |
+| 状态检测 | `GET /meetings/{id}/summary-status` → `{ollama: "missing"\|"no-model"\|"ready"}` | 一次调用拿全部状态 |
 | 重复生成 | 覆盖旧摘要。每次用最新 segments 重新生成 | v1 简单，不做幂等/去重 |
 
 **回溯检查**：
 - 过程纪律: 摘要不属 FunASR 迁移 TDD 子任务。正确性由人工验证。无矛盾 依赖 Ollama + qwen3:8b。Issue-0 需验证。无矛盾
 - A1: FR #7「Ollama qwen3:8b，用户手动触发」。6 条全部对齐。无矛盾
 - A2: ADR-003 不覆盖 Ollama 细节 (属 FunASR 架构决策)。A2 定了三方服务拓扑 (:8178/:5167/:11434)。无矛盾
+
+### Q17 — 自动标题生成
+
+**决策**：会后自动调用 Ollama 生成 ≤ 10 字标题。
+
+| 决策点 | 选择 | 理由 |
+|---|---|---|
+| 触发时机 | `/session/end` 返回后自动触发 | 会后自然时机，用户不用手动操作 |
+| prompt | "请用 10 字以内概括以下会议内容" + 前 10 条 segments | 轻量 prompt，~1s。前 10 条足以判断主题 |
+| 存储 | FastAPI `meetings.title` 列 (Issue 01 migration 已预留) | 标题是会议元信息，归 FastAPI |
+| 失败处理 | 生成失败 → 保持日期时间标题，不重试 | 标题非关键功能，静默降级 |
+| 端点 | `POST /meetings/{id}/generate-title` | 读 transcript_json 前 10 条 → Ollama → 写 title 列 |
+
+**回溯检查**：
+- 过程纪律: 非 TDD 子任务。正确性由人工验证。无矛盾
+- A1: UX 增强，不与任何 FR 冲突。无矛盾
+- A2: FastAPI 作为 meetings 数据归属，标题存 FastAPI 一致。无矛盾
+
+### Q15 补充 — `/health` loading 进度态
+
+**决策**：`GET /health` 三态响应 + `loading` 不触发断路器。
+
+| 状态 | 响应 | 断路器行为 |
+|---|---|---|
+| `loading` | `{"status":"loading", "model":"SenseVoiceSmall", "progress":45.0}` | 不触发断路器。Rust 等待，前端展示进度条 |
+| `ok` | `{"status":"ok"}` | 正常恢复信号 |
+| `error` | `{"status":"error", "message":"..."}` | 计为 `on_failure`，触发断路器计数 |
+
+**回溯检查**：
+- 过程纪律: 非新增 TDD 子任务。无矛盾
+- A1: FR #6 需要知道服务是否恢复中。loading 态是恢复路径的自然延伸。无矛盾
+- A2: ADR-003 定了健康探测，loading 是探测响应的细化。无矛盾
+
+### Q10 补充 — save-transcript 失败容灾
+
+**决策**：FastAPI `/save-transcript` 失败时 segments 写入 sidecar，启动时自动重试。
+
+| 决策点 | 选择 | 理由 |
+|---|---|---|
+| 检测时机 | Rust 调 `POST /save-transcript` 返回非 200 | ECONNREFUSED / ETIMEDOUT / HTTP 5xx 都触发 |
+| 容灾策略 | segments 写入 sidecar (每行一个 segment，已含最终姓名) | sidecar 已在录音中持续写入。save 失败时额外保留这些 segments |
+| 恢复触发 | Rust 启动时扫描 sidecar → 尝试 `POST /save-transcript` 重试 | 与 FunASR 崩溃恢复共用扫描机制 |
+| 重试次数 | 最多 3 次，间隔 5s。全部失败 → 保留 sidecar，前端横幅提示 | 不无限重试，但数据不丢 |
+| 成功后 | save 成功 → 删除 sidecar 文件 | 数据已安全落 DB |
+
+**回溯检查**：
+- 过程纪律: 非 TDD 子任务，属 C1 集成接线。无矛盾
+- A1: FR #6「崩溃容灾」。save-transcript 失败是容灾子场景。无矛盾
+- A2: ADR-003 §7「sidecar 是 segments 恢复的唯一载体」。save 失败也走 sidecar，一致。无矛盾
+
 

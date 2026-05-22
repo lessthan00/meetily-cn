@@ -1,126 +1,141 @@
-# TDD 05a — 断路器状态机
+# TDD 05a — 断路器状态机 (差异化策略)
 
 **父 Issue**: [#05 容灾恢复](../issues/05-crash-recovery.md)
 
 ## 测试范围
 
-断路器的状态转换逻辑：从正常 → 计数 → 打开 → 半开 → 关闭。
+断路器的状态转换逻辑。**6 种错误类型差异化处理** (Q15)：立即打开 (ECONNREFUSED/ECONNRESET/DeserializationFailed) vs 累积打开 (Http5xx/Unhealthy 连续 3 次) vs 重试后打开 (Timeout 重试 1 次)。
+
+## ErrorKind 枚举
+
+```rust
+enum ErrorKind {
+    ConnectionRefused,    // 立即打开
+    ConnectionReset,      // 立即打开
+    Timeout,              // 重试 1 次
+    Http5xx,              // 连续 3 次
+    Unhealthy,            // 连续 3 次
+    DeserializationFailed,// 立即打开
+}
+```
 
 ## RED — 先写失败测试
 
 ```rust
-// funasr_client.rs tests
-
 #[test]
 fn circuit_breaker_starts_closed() {
-    let cb = CircuitBreaker::new(3);
+    let cb = CircuitBreaker::new();
     assert_eq!(cb.state(), CircuitState::Closed);
     assert!(cb.allow_request());
 }
 
-
-#[test]
-fn single_error_does_not_open() {
-    let mut cb = CircuitBreaker::new(3);
-    cb.record_error(ErrorKind::Http5xx);
-    assert_eq!(cb.state(), CircuitState::Closed);
-    assert!(cb.allow_request());
-}
-
+// === 立即打开类 (ConnectionRefused / ConnectionReset / DeserializationFailed) ===
 
 #[test]
 fn connection_refused_opens_immediately() {
-    let mut cb = CircuitBreaker::new(3);
+    let mut cb = CircuitBreaker::new();
     cb.record_error(ErrorKind::ConnectionRefused);
     assert_eq!(cb.state(), CircuitState::Open);
-    assert!(!cb.allow_request());
 }
-
 
 #[test]
 fn connection_reset_opens_immediately() {
-    let mut cb = CircuitBreaker::new(3);
+    let mut cb = CircuitBreaker::new();
     cb.record_error(ErrorKind::ConnectionReset);
     assert_eq!(cb.state(), CircuitState::Open);
 }
 
+#[test]
+fn deserialization_failed_opens_immediately() {
+    let mut cb = CircuitBreaker::new();
+    cb.record_error(ErrorKind::DeserializationFailed);
+    assert_eq!(cb.state(), CircuitState::Open);
+}
+
+// === 累积打开类 (Http5xx / Unhealthy: 连续 3 次) ===
 
 #[test]
 fn three_consecutive_5xx_opens() {
-    let mut cb = CircuitBreaker::new(3);
+    let mut cb = CircuitBreaker::new();
     cb.record_error(ErrorKind::Http5xx);
     cb.record_error(ErrorKind::Http5xx);
-    assert_eq!(cb.state(), CircuitState::Closed);  // 还没开
+    assert_eq!(cb.state(), CircuitState::Closed);
     cb.record_error(ErrorKind::Http5xx);
     assert_eq!(cb.state(), CircuitState::Open);
 }
 
+#[test]
+fn three_consecutive_unhealthy_opens() {
+    let mut cb = CircuitBreaker::new();
+    cb.record_error(ErrorKind::Unhealthy);
+    cb.record_error(ErrorKind::Unhealthy);
+    cb.record_error(ErrorKind::Unhealthy);
+    assert_eq!(cb.state(), CircuitState::Open);
+}
+
+// === 重试类 (Timeout: 重试 1 次) ===
 
 #[test]
 fn timeout_retry_once_then_open() {
-    let mut cb = CircuitBreaker::new(3);  // timeout 重试阈值 = 1
+    let mut cb = CircuitBreaker::new();
     cb.record_error(ErrorKind::Timeout);
-    assert!(cb.should_retry());  // 允许重试 1 次
+    assert!(!cb.is_open());  // 还没开，等待重试
     cb.record_retry_failed();
     assert_eq!(cb.state(), CircuitState::Open);
 }
 
+// === 成功重置 ===
 
 #[test]
-fn successful_request_resets_5xx_counter() {
-    let mut cb = CircuitBreaker::new(3);
+fn success_resets_accumulate_counter() {
+    let mut cb = CircuitBreaker::new();
     cb.record_error(ErrorKind::Http5xx);
     cb.record_error(ErrorKind::Http5xx);
-    cb.record_success();  // 中间成功 → 重置计数
+    cb.record_success();
     cb.record_error(ErrorKind::Http5xx);
     cb.record_error(ErrorKind::Http5xx);
-    assert_eq!(cb.state(), CircuitState::Closed);  // 只累计到 2
+    assert_eq!(cb.state(), CircuitState::Closed);
 }
 
+// === 半开 → 恢复 ===
 
 #[test]
-fn open_circuit_blocks_all_requests() {
-    let mut cb = CircuitBreaker::new(3);
-    cb.record_error(ErrorKind::ConnectionRefused);
-    assert!(!cb.allow_request());
-    assert!(!cb.allow_request());  // 持续阻断
-}
-
+fn open_to_halfopen_after_timeout() { /* timeout T 后进入半开 */ }
 
 #[test]
-fn health_probe_allowed_when_open() {
-    let mut cb = CircuitBreaker::new(3);
-    cb.record_error(ErrorKind::ConnectionRefused);
-    assert!(cb.allow_health_probe());  // 健康探测不被阻断
-    assert!(!cb.allow_request());      // 但正常请求仍被阻断
-}
-
-
-#[test]
-fn two_consecutive_health_success_closes_circuit() {
-    let mut cb = CircuitBreaker::new(3);
-    cb.record_error(ErrorKind::ConnectionRefused);
-    assert_eq!(cb.state(), CircuitState::Open);
-
-    // 15s 后第一次健康探测成功
+fn halfopen_two_consecutive_health_success_closes() {
+    let mut cb = CircuitBreaker::new();
+    cb.record_error(ErrorKind::ConnectionRefused); // → Open
+    cb.transition_to_half_open();  // timeout 后
     cb.record_health_success();
     assert_eq!(cb.state(), CircuitState::HalfOpen);
-
-    // 又一次成功
     cb.record_health_success();
     assert_eq!(cb.state(), CircuitState::Closed);
-    assert!(cb.allow_request());
 }
 
+#[test]
+fn halfopen_health_failure_reopens() {
+    let mut cb = CircuitBreaker::new();
+    cb.record_error(ErrorKind::ConnectionRefused);
+    cb.transition_to_half_open();
+    cb.record_health_success();
+    cb.record_health_failure();
+    assert_eq!(cb.state(), CircuitState::Open);
+}
+
+// === 阻断行为 ===
 
 #[test]
-fn health_failure_keeps_circuit_open() {
-    let mut cb = CircuitBreaker::new(3);
+fn open_circuit_blocks_requests_but_allows_health_probe() {
+    let mut cb = CircuitBreaker::new();
     cb.record_error(ErrorKind::ConnectionRefused);
+    assert!(!cb.allow_request());
+    assert!(cb.allow_health_probe());
+}
 
-    cb.record_health_success();   // → HalfOpen
-    cb.record_health_failure();   // 探测失败
-    assert_eq!(cb.state(), CircuitState::Open);  // 回退
+#[test]
+fn halfopen_blocks_requests_but_allows_health_probe() {
+    // 半开时正常 chunk 继续丢弃，只允许探测
 }
 ```
 
@@ -131,28 +146,36 @@ fn health_failure_keeps_circuit_open() {
 enum CircuitState { Closed, Open, HalfOpen }
 
 struct CircuitBreaker {
-    error_threshold: u32,
-    error_count: u32,
-    health_count: u32,
     state: CircuitState,
-    timeout_retry_remaining: u32,
+    accumulate_count: u32,  // Http5xx/Unhealthy 累计计数
+    health_success_count: u32,  // 半开中连续成功计数
+    timeout_retry_pending: bool,
 }
 
 impl CircuitBreaker {
-    fn record_error(&mut self, kind: ErrorKind) { /* ... */ }
-    fn record_success(&mut self) { /* ... */ }
+    fn record_error(&mut self, kind: ErrorKind) {
+        match kind {
+            ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::DeserializationFailed => self.state = CircuitState::Open,
+            ErrorKind::Timeout => self.timeout_retry_pending = true,
+            ErrorKind::Http5xx | ErrorKind::Unhealthy => {
+                self.accumulate_count += 1;
+                if self.accumulate_count >= 3 { self.state = CircuitState::Open; }
+            }
+        }
+    }
+    fn record_success(&mut self) { self.accumulate_count = 0; }
     fn record_health_success(&mut self) { /* ... */ }
     fn record_health_failure(&mut self) { /* ... */ }
-    fn allow_request(&self) -> bool { /* ... */ }
-    fn allow_health_probe(&self) -> bool { /* ... */ }
-    fn should_retry(&self) -> bool { /* ... */ }
+    fn record_retry_failed(&mut self) { self.state = CircuitState::Open; }
 }
 ```
 
 ## REFACTOR
 
-- 考虑用 `enum` 统一 `ErrorKind`（ConnectionRefused / ConnectionReset / Timeout / Http5xx）
+- 用 `enum` 统一 `ErrorKind`
 
 ## 预计耗时
 
-< 1.5 小时（状态机 + 边界测试最多）
+< 1.5 小时 (~12 条测试，状态机 + 差异化处理)
